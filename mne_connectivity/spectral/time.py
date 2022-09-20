@@ -23,7 +23,7 @@ def spectral_connectivity_time(data, names=None, method='coh', average=False,
                                sm_freqs=1, sm_kernel='hanning',
                                mode='cwt_morlet', mt_bandwidth=None,
                                cwt_freqs=None, n_cycles=7, decim=1,
-                               block_size=1000, n_jobs=1, verbose=None):
+                               block_size=500, n_jobs=1, verbose=None):
     """Compute frequency- and time-frequency-domain connectivity measures.
 
     This method computes time-resolved connectivity measures from epoched data.
@@ -39,11 +39,10 @@ def spectral_connectivity_time(data, names=None, method='coh', average=False,
     %(names)s
     method : str | list of str
         Connectivity measure(s) to compute. These can be ``['coh', 'plv',
-        'sxy', 'pli', 'wpli']``. These are:
+        'pli', 'wpli']``. These are:
 
             * 'coh' : Coherence
             * 'plv' : Phase-Locking Value (PLV)
-            * 'sxy' : Cross-spectrum
             * 'pli' : Phase-Lag Index
             * 'wpli': Weighted Phase-Lag Index
 
@@ -104,8 +103,8 @@ def spectral_connectivity_time(data, names=None, method='coh', average=False,
         decomposition. default 1 If int, returns tfr[…, ::decim]. If slice,
         returns tfr[…, decim].
     block_size : int
-        Number of epochs to compute at once (higher numbers are faster
-        but require more memory).
+        Number of time points to compute at once. Higher numbers are faster
+        but require more memory.
     n_jobs : int
         Number of connections to compute in parallel.
     %(verbose)s
@@ -177,8 +176,6 @@ def spectral_connectivity_time(data, names=None, method='coh', average=False,
         by::
 
             PLV = |E[Sxy/|Sxy|]|
-
-        'sxy' : Cross spectrum Sxy
 
         'pli' : Phase Lag Index (PLI) :footcite:`StamEtAl2007` given by::
 
@@ -331,17 +328,6 @@ def spectral_connectivity_time(data, names=None, method='coh', average=False,
         n_freqs = len(freqs)
         out_freqs = freqs
 
-    # build block size indices
-    if block_size > n_epochs:
-        block_size = n_epochs
-
-    if isinstance(block_size, int):
-        n_blocks = n_epochs // block_size + 1 if n_epochs % block_size \
-            else n_epochs // block_size
-        blocks = np.array_split(np.arange(n_epochs), n_blocks)
-    else:
-        blocks = [np.arange(n_epochs)]
-
     # compute connectivity on blocks of trials
     conn = dict()
     for m in method:
@@ -355,16 +341,16 @@ def spectral_connectivity_time(data, names=None, method='coh', average=False,
         mode=mode, sfreq=sfreq, freqs=freqs, faverage=faverage,
         n_cycles=n_cycles, mt_bandwidth=mt_bandwidth,
         decim=decim, kw_cwt={}, kw_mt={}, n_jobs=n_jobs,
-        verbose=verbose)
+        verbose=verbose, block_size=block_size)
 
-    for epoch_idx in blocks:
+    for epoch_idx in np.arange(n_epochs):
         # compute time-resolved spectral connectivity
-        conn_tr = _spectral_connectivity(data[epoch_idx, ...], **call_params)
+        logger.info(f"    Processing epoch {epoch_idx} / {n_epochs}")
+        conn_tr = _spectral_connectivity(data[[epoch_idx], ...], **call_params)
 
         # merge results
         for m in method:
-            conn[m][epoch_idx, ...] = np.stack(conn_tr[m],
-                                               axis=1).squeeze(axis=-1)
+            conn[m][[epoch_idx], ...] = conn_tr[m]
 
     if indices is None:
         conn_flat = conn
@@ -404,7 +390,7 @@ def _spectral_connectivity(data, method, kernel, foi_idx,
                            source_idx, target_idx,
                            mode, sfreq, freqs, faverage, n_cycles,
                            mt_bandwidth=None, decim=1, kw_cwt={}, kw_mt={},
-                           n_jobs=1, verbose=False):
+                           n_jobs=1, verbose=False, block_size=500):
     """Estimate time-resolved connectivity for one epoch.
 
     See spectral_connectivity_epoch."""
@@ -426,17 +412,13 @@ def _spectral_connectivity(data, method, kernel, foi_idx,
 
     # compute for each required connectivity method
     this_conn = {}
-    conn_func = {'coh': _coh, 'plv': _plv, 'sxy': _cs, 'pli': _pli,
-                 'wpli': _wpli}
+    conn_func = {'coh': _coh, 'plv': _plv, 'pli': _pli, 'wpli': _wpli}
     for m in method:
         c_func = conn_func[m]
         # compute connectivity
         this_conn[m] = c_func(out, kernel, foi_idx, source_idx,
-                              target_idx, n_jobs=n_jobs,
-                              verbose=verbose, total=n_pairs,
-                              faverage=faverage)
-        # mean over tapers
-        this_conn[m] = [c.mean(axis=1) for c in this_conn[m]]
+                              target_idx, n_jobs, verbose, n_pairs,
+                              faverage, block_size)
 
     return this_conn
 
@@ -447,179 +429,226 @@ def _spectral_connectivity(data, method, kernel, foi_idx,
 ###############################################################################
 ###############################################################################
 
+
+def _multiply_conjugate_time(real: np.ndarray, imag: np.ndarray,
+                             transpose_axes: tuple) -> np.ndarray:
+    """
+    Helper function to compute the product of a complex array and its conjugate.
+    Preserves the product values across e.g., time.
+
+    Ported over from HyPyP.
+
+    Arguments:
+        real: the real part of the array.
+        imag: the imaginary part of the array.
+        transpose_axes: axes to transpose for matrix multiplication.
+    Returns:
+        product: the product of the array and its complex conjugate.
+    """
+    formula = 'jlkm,jlmn->jlknm'
+    product = np.einsum(formula, real, real.transpose(transpose_axes)) + \
+              np.einsum(formula, imag, imag.transpose(transpose_axes)) - 1j * \
+              (np.einsum(formula, real, imag.transpose(transpose_axes)) - \
+               np.einsum(formula, imag, real.transpose(transpose_axes)))
+
+    return product
+
+
 def _coh(w, kernel, foi_idx, source_idx, target_idx, n_jobs, verbose, total,
-         faverage):
+         faverage, block_size):
     """Pairwise coherence.
 
     Input signal w is of shape (n_epochs, n_chans, n_tapers, n_freqs,
     n_times)."""
-    # auto spectra (faster that w * w.conj())
-    s_auto = w.real ** 2 + w.imag ** 2
 
-    # smooth the auto spectra
-    s_auto = _smooth_spectra(s_auto, kernel)
+    w = w.transpose((0, 2, 3, 1, 4))  # epochs, tapers, freqs, channels, times
+    amp = np.abs(w) ** 2
+    n_epochs, n_tapers, n_freqs, n_channels, n_times = w.shape
+    con_res = np.zeros((n_epochs, n_tapers, len(source_idx), n_freqs))
 
-    def pairwise_coh(w_x, w_y):
-        # compute coherence
-        s_xy = w[:, w_y] * np.conj(w[:, w_x])
-        s_xy = _smooth_spectra(s_xy, kernel)
-        s_xx = s_auto[:, w_x]
-        s_yy = s_auto[:, w_y]
-        out = np.abs(s_xy.mean(axis=-1, keepdims=True)) / \
-            np.sqrt(s_xx.mean(axis=-1, keepdims=True) *
-                    s_yy.mean(axis=-1, keepdims=True))
-        # mean inside frequency sliding window (if needed)
-        if isinstance(foi_idx, np.ndarray) and faverage:
-            return _foi_average(out, foi_idx)
-        else:
-            return out
+    # Compute using for-loop to reduce memory usage.
+    for freq in range(n_freqs):
+        dphi = np.zeros((n_epochs, n_tapers, n_channels, n_channels, 1),
+                        dtype=complex)
+        n_blocks = n_times // block_size if not n_times % block_size \
+            else n_times // block_size + 1
+        blocks = np.array_split(np.arange(n_times), n_blocks)
+        for block_indices in blocks:
+            t_start, t_end = block_indices[0], block_indices[-1]
+            acc_dphi = _multiply_conjugate_time(
+                np.real(w[:, :, freq, :, t_start:t_end+1]),
+                np.imag(w[:, :, freq, :, t_start:t_end+1]),
+                transpose_axes=(0, 1, 3, 2))
+            acc_dphi = np.expand_dims(acc_dphi, axis=-2)
+            # acc_dphi = _smooth_spectra(dphi, kernel)
+            dphi += np.sum(acc_dphi, axis=-1)
+        amp_sum = np.nansum(amp[:, :, freq, ...], axis=-1)
+        con = np.abs(dphi) / np.expand_dims(
+            np.sqrt(np.einsum('nil,nik->nilk', amp_sum, amp_sum)), axis=-1)
+        con = con[:, :, source_idx, target_idx, ...]
+        con_res[:, :, :, freq] = con.reshape(n_epochs, n_tapers, -1)
 
-    # define the function to compute in parallel
-    parallel, p_fun, n_jobs = parallel_func(
-        pairwise_coh, n_jobs=n_jobs, verbose=verbose, total=total)
+    con_res = con_res.mean(axis=1)  # mean over tapers
 
-    # compute pairwise coherence coherence
-    return parallel(p_fun(s, t) for s, t in zip(source_idx, target_idx))
+    # mean over frequency bands if requested
+    if isinstance(foi_idx, np.ndarray) and faverage:
+        return _foi_average(con_res, foi_idx)
+    else:
+        return con_res
 
 
 def _plv(w, kernel, foi_idx, source_idx, target_idx, n_jobs, verbose, total,
-         faverage):
-    """Pairwise phase-locking value.
+         faverage, block_size):
+    """Phase-locking value.
 
     Input signal w is of shape (n_epochs, n_chans, n_tapers, n_freqs,
     n_times)."""
-    # define the pairwise plv
-    def pairwise_plv(w_x, w_y):
-        # compute plv
-        s_xy = w[:, w_y] * np.conj(w[:, w_x])
-        # complex exponential of phase differences
-        exp_dphi = s_xy / np.abs(s_xy)
-        # smooth e^(-i*\delta\phi)
-        exp_dphi = _smooth_spectra(exp_dphi, kernel)
-        # mean over samples (time axis)
-        exp_dphi_mean = exp_dphi.mean(axis=-1, keepdims=True)
-        out = np.abs(exp_dphi_mean)
-        # mean inside frequency sliding window (if needed)
-        if isinstance(foi_idx, np.ndarray) and faverage:
-            return _foi_average(out, foi_idx)
-        else:
-            return out
 
-    # define the function to compute in parallel
-    parallel, p_fun, n_jobs = parallel_func(
-        pairwise_plv, n_jobs=n_jobs, verbose=verbose, total=total)
+    w = w.transpose((0, 2, 3, 1, 4))  # epochs, tapers, freqs, channels, times
+    phase = w / np.abs(w)
+    n_epochs, n_tapers, n_freqs, n_channels, n_times = w.shape
+    con_res = np.zeros((n_epochs, n_tapers, len(source_idx), n_freqs))
 
-    # compute the single trial plv
-    return parallel(p_fun(s, t) for s, t in zip(source_idx, target_idx))
+    # Compute using for-loop to reduce memory usage.
+    for freq in range(n_freqs):
+        n_blocks = n_times // block_size if not n_times % block_size \
+            else n_times // block_size + 1
+        blocks = np.array_split(np.arange(n_times), n_blocks)
+        dphi_sum = np.zeros((n_epochs, n_tapers, n_channels, n_channels, 1),
+                            dtype=complex)
+        for block_indices in blocks:
+            t_start, t_end = block_indices[0], block_indices[-1]
+            dphi = _multiply_conjugate_time(
+                np.real(phase[:, :, freq, :, t_start:t_end+1]),
+                np.imag(phase[:, :, freq, :, t_start:t_end+1]),
+                transpose_axes=(0, 1, 3, 2))
+            dphi = np.expand_dims(dphi, axis=-2)
+            # dphi = _smooth_spectra(dphi, kernel)
+            dphi_sum += np.sum(dphi, axis=-1)
+        con = abs(dphi_sum) / n_times
+        con = con[:, :, source_idx, target_idx, ...]
+        con_res[:, :, :, freq] = con.reshape(n_epochs, n_tapers, -1)
+
+    con_res = con_res.mean(axis=1)  # mean over tapers
+
+    # mean over frequency bands if requested
+    if isinstance(foi_idx, np.ndarray) and faverage:
+        return _foi_average(con_res, foi_idx)
+    else:
+        return con_res
 
 
 def _pli(w, kernel, foi_idx, source_idx, target_idx, n_jobs, verbose, total,
-         faverage):
-    """Pairwise phase-lag index.
+         faverage, block_size):
+    """Phase-lag index.
 
     Input signal w is of shape (n_epochs, n_chans, n_tapers, n_freqs,
     n_times)."""
-    # define the pairwise pli
-    def pairwise_pli(w_x, w_y):
-        # compute cross spectrum
-        s_xy = w[:, w_y] * np.conj(w[:, w_x])
-        # smooth e^(-i*\delta\phi)
-        s_xy = _smooth_spectra(s_xy, kernel)
-        # phase lag index
-        out = np.abs(np.mean(np.sign(np.imag(s_xy)),
-                             axis=-1, keepdims=True))
-        # mean inside frequency sliding window (if needed)
-        if isinstance(foi_idx, np.ndarray) and faverage:
-            return _foi_average(out, foi_idx)
-        else:
-            return out
+    w = w.transpose((0, 2, 3, 1, 4))  # epochs, tapers, freqs, channels, times
+    n_epochs, n_tapers, n_freqs, n_channels, n_times = w.shape
+    con_res = np.zeros((n_epochs, n_tapers, len(source_idx), n_freqs))
 
-    # define the function to compute in parallel
-    parallel, p_fun, n_jobs = parallel_func(
-        pairwise_pli, n_jobs=n_jobs, verbose=verbose, total=total)
+    # Compute using for-loop to reduce memory usage.
+    for freq in range(n_freqs):
+        n_blocks = n_times // block_size if not n_times % block_size \
+            else n_times // block_size + 1
+        blocks = np.array_split(np.arange(n_times), n_blocks)
+        dphi_sign_sum = np.zeros((n_epochs, n_tapers,
+                                  n_channels, n_channels, 1), dtype=complex)
+        for block_indices in blocks:
+            t_start, t_end = block_indices[0], block_indices[-1]
+            dphi = _multiply_conjugate_time(
+                np.real(w[:, :, freq, :, t_start:t_end+1]),
+                np.imag(w[:, :, freq, :, t_start:t_end+1]),
+                transpose_axes=(0, 1, 3, 2))
+            dphi = np.expand_dims(dphi, axis=-2)
+            # dphi = _smooth_spectra(dphi, kernel)
+            dphi_sign_sum += np.sum(np.sign(np.imag(dphi)), axis=-1)
+        con = abs(dphi_sign_sum / n_times)
+        con = con[:, :, source_idx, target_idx, ...]
+        con_res[:, :, :, freq] = con.reshape(n_epochs, n_tapers, -1)
 
-    # compute the single trial pli
-    return parallel(p_fun(s, t) for s, t in zip(source_idx, target_idx))
+    con_res = con_res.mean(axis=1)  # mean over tapers
+
+    # mean over frequency bands if requested
+    if isinstance(foi_idx, np.ndarray) and faverage:
+        return _foi_average(con_res, foi_idx)
+    else:
+        return con_res
 
 
 def _wpli(w, kernel, foi_idx, source_idx, target_idx, n_jobs, verbose, total,
-          faverage):
-    """Pairwise weighted phase-lag index.
+          faverage, block_size):
+    """Weighted phase-lag index.
 
     Input signal w is of shape (n_epochs, n_chans, n_tapers, n_freqs,
     n_times)."""
-    # define the pairwise wpli
-    def pairwise_wpli(w_x, w_y):
-        # compute cross spectrum
-        s_xy = w[:, w_y] * np.conj(w[:, w_x])
-        # smooth
-        s_xy = _smooth_spectra(s_xy, kernel)
-        # magnitude of the mean of the imaginary part of the cross spectrum
-        s_xy_mean_abs = np.abs(s_xy.imag.mean(axis=-1, keepdims=True))
-        # mean of the magnitudes of the imaginary part of the cross spectrum
-        s_xy_abs_mean = np.abs(s_xy.imag).mean(axis=-1, keepdims=True)
-        out = s_xy_mean_abs / s_xy_abs_mean
-        # mean inside frequency sliding window (if needed)
-        if isinstance(foi_idx, np.ndarray) and faverage:
-            return _foi_average(out, foi_idx)
-        else:
-            return out
+    w = w.transpose((0, 2, 3, 1, 4))  # epochs, tapers, freqs, channels, times
+    n_epochs, n_tapers, n_freqs, n_channels, n_times = w.shape
+    con_res = np.zeros((n_epochs, n_tapers, len(source_idx), n_freqs))
 
-    # define the function to compute in parallel
-    parallel, p_fun, n_jobs = parallel_func(
-        pairwise_wpli, n_jobs=n_jobs, verbose=verbose, total=total)
+    # Compute using for-loop to reduce memory usage.
+    for freq in range(n_freqs):
+        n_blocks = n_times // block_size if not n_times % block_size \
+            else n_times // block_size + 1
+        blocks = np.array_split(np.arange(n_times), n_blocks)
+        con_num_sum = np.zeros((n_epochs, n_tapers,
+                                  n_channels, n_channels, 1))
+        con_den_sum = np.zeros((n_epochs, n_tapers,
+                                  n_channels, n_channels, 1))
+        for block_indices in blocks:
+            t_start, t_end = block_indices[0], block_indices[-1]
+            dphi = _multiply_conjugate_time(
+                np.real(w[:, :, freq, :, t_start:t_end+1]),
+                np.imag(w[:, :, freq, :, t_start:t_end+1]),
+                transpose_axes=(0, 1, 3, 2))
+            dphi = np.expand_dims(dphi, axis=-2)
+            # dphi = _smooth_spectra(dphi, kernel)
+            con_num_sum += np.sum(abs(np.imag(dphi))
+                                  * np.sign(np.imag(dphi)), axis=-1)
+            con_den_sum += np.sum(abs(np.imag(dphi)), axis=-1)
+        con_num = abs(con_num_sum / n_times)
+        con_den = con_den_sum / n_times
+        con_den[con_den == 0] = 1
+        con = con_num / con_den
+        con = con[:, :, source_idx, target_idx, ...]
+        con_res[:, :, :, freq] = con.reshape(n_epochs, n_tapers, -1)
 
-    # compute the single trial wpli
-    return parallel(p_fun(s, t) for s, t in zip(source_idx, target_idx))
+    con_res = con_res.mean(axis=1)  # mean over tapers
 
-
-def _cs(w, kernel, foi_idx, source_idx, target_idx, n_jobs, verbose, total,
-        faverage):
-    """Pairwise cross-spectra."""
-    # define the pairwise cross-spectra
-    def pairwise_cs(w_x, w_y):
-        #  computes the cross-spectra
-        out = w[:, w_x] * np.conj(w[:, w_y])
-        out = _smooth_spectra(out, kernel)
-        if isinstance(foi_idx, np.ndarray) and faverage:
-            return _foi_average(out, foi_idx)
-        else:
-            return out
-
-    # define the function to compute in parallel
-    parallel, p_fun, n_jobs = parallel_func(
-        pairwise_cs, n_jobs=n_jobs, verbose=verbose, total=total)
-
-    # compute the single trial coherence
-    return parallel(p_fun(s, t) for s, t in zip(source_idx, target_idx))
+    # mean over frequency bands if requested
+    if isinstance(foi_idx, np.ndarray) and faverage:
+        return _foi_average(con_res, foi_idx)
+    else:
+        return con_res
 
 
 def _foi_average(conn, foi_idx):
     """Average inside frequency bands.
 
-    The frequency dimension should be located at -2.
+    The frequency dimension should be located at -1.
 
     Parameters
     ----------
     conn : np.ndarray
-        Array of shape (..., n_freqs, n_times)
+        Array of shape (..., n_freqs)
     foi_idx : array_like
         Array of indices describing frequency bounds of shape (n_foi, 2)
 
     Returns
     -------
     conn_f : np.ndarray
-        Array of shape (..., n_foi, n_times)
+        Array of shape (..., n_foi)
     """
     # get the number of foi
     n_foi = foi_idx.shape[0]
 
     # get input shape and replace n_freqs with the number of foi
     sh = list(conn.shape)
-    sh[-2] = n_foi
+    sh[-1] = n_foi
 
     # compute average
     conn_f = np.zeros(sh, dtype=conn.dtype)
     for n_f, (f_s, f_e) in enumerate(foi_idx):
-        conn_f[..., n_f, :] = conn[..., f_s:f_e, :].mean(-2)
+        conn_f[..., n_f] = conn[..., f_s:f_e].mean(-1)
     return conn_f
