@@ -23,7 +23,7 @@ def spectral_connectivity_time(data, names=None, method='coh', average=False,
                                sm_freqs=1, sm_kernel='hanning',
                                mode='cwt_morlet', mt_bandwidth=None,
                                cwt_freqs=None, n_cycles=7, decim=1,
-                               block_size=500, n_jobs=1, verbose=None):
+                               block_size=None, n_jobs=1, verbose=None):
     """Compute frequency- and time-frequency-domain connectivity measures.
 
     This method computes time-resolved connectivity measures from epoched data.
@@ -102,9 +102,20 @@ def spectral_connectivity_time(data, names=None, method='coh', average=False,
         To reduce memory usage, decimation factor after time-frequency
         decomposition. default 1 If int, returns tfr[…, ::decim]. If slice,
         returns tfr[…, decim].
-    block_size : int
-        Number of time points to compute at once. Higher numbers are faster
-        but require more memory.
+    block_size : dict | None
+        Dictionary of block size for connectivity computation. Example:
+            ``block_size={
+                    "epochs"=10,
+                    "times"=500
+                    }``
+        Computation is faster with larger values, but more memory is required.
+        The memory requirement in bytes is proportional to
+            ``16*epochs*n_freqs*(mt_bandwidth-1)*times**2``.
+        By default,
+            ``block_size={
+                "epochs"=1000,
+                "times"=1000
+                }
     n_jobs : int
         Number of connections to compute in parallel.
     %(verbose)s
@@ -262,6 +273,18 @@ def spectral_connectivity_time(data, names=None, method='coh', average=False,
     if np.any(fmin > fmax):
         raise ValueError('fmax must be larger than fmin')
 
+    # Check that block_size is correctly set up
+    if block_size is None:
+        block_size = {
+            "epochs": 1000,
+            "times": 1000
+        }
+    else:
+        if "epochs" not in block_size:
+            block_size["epochs"] = 1000
+        if "times" not in block_size:
+            block_size["times"] = 1000
+
     # convert kernel width in time to samples
     if isinstance(sm_times, (int, float)):
         sm_times = int(np.round(sm_times * sfreq))
@@ -343,14 +366,19 @@ def spectral_connectivity_time(data, names=None, method='coh', average=False,
         decim=decim, kw_cwt={}, kw_mt={}, n_jobs=n_jobs,
         verbose=verbose, block_size=block_size)
 
-    for epoch_idx in np.arange(n_epochs):
+    n_epoch_blocks = n_epochs // block_size["epochs"] \
+        if not n_epochs % block_size["epochs"] \
+        else n_epochs // block_size["epochs"] + 1
+    epoch_blocks = np.array_split(np.arange(n_epochs), n_epoch_blocks)
+
+    for epoch_idx in epoch_blocks:
         # compute time-resolved spectral connectivity
-        logger.info(f"    Processing epoch {epoch_idx} / {n_epochs}")
-        conn_tr = _spectral_connectivity(data[[epoch_idx], ...], **call_params)
+        logger.info(f"    Processing epochs {epoch_idx} / {n_epochs}")
+        conn_tr = _spectral_connectivity(data[epoch_idx, ...], **call_params)
 
         # merge results
         for m in method:
-            conn[m][[epoch_idx], ...] = conn_tr[m]
+            conn[m][epoch_idx, ...] = conn_tr[m]
 
     if indices is None:
         conn_flat = conn
@@ -418,7 +446,7 @@ def _spectral_connectivity(data, method, kernel, foi_idx,
         # compute connectivity
         this_conn[m] = c_func(out, kernel, foi_idx, source_idx,
                               target_idx, n_jobs, verbose, n_pairs,
-                              faverage, block_size)
+                              faverage, block_size["times"])
 
     return this_conn
 
@@ -445,7 +473,7 @@ def _multiply_conjugate_time(real: np.ndarray, imag: np.ndarray,
     Returns:
         product: the product of the array and its complex conjugate.
     """
-    formula = 'jlkm,jlmn->jlknm'
+    formula = 'ijlkm,ijlmn->ijlknm'
     product = np.einsum(formula, real, real.transpose(transpose_axes)) + \
               np.einsum(formula, imag, imag.transpose(transpose_axes)) - 1j * \
               (np.einsum(formula, real, imag.transpose(transpose_axes)) - \
@@ -464,29 +492,29 @@ def _coh(w, kernel, foi_idx, source_idx, target_idx, n_jobs, verbose, total,
     w = w.transpose((0, 2, 3, 1, 4))  # epochs, tapers, freqs, channels, times
     amp = np.abs(w) ** 2
     n_epochs, n_tapers, n_freqs, n_channels, n_times = w.shape
-    con_res = np.zeros((n_epochs, n_tapers, len(source_idx), n_freqs))
 
     # Compute using for-loop to reduce memory usage.
-    for freq in range(n_freqs):
-        dphi = np.zeros((n_epochs, n_tapers, n_channels, n_channels, 1),
-                        dtype=complex)
-        n_blocks = n_times // block_size if not n_times % block_size \
-            else n_times // block_size + 1
-        blocks = np.array_split(np.arange(n_times), n_blocks)
-        for block_indices in blocks:
-            t_start, t_end = block_indices[0], block_indices[-1]
-            acc_dphi = _multiply_conjugate_time(
-                np.real(w[:, :, freq, :, t_start:t_end+1]),
-                np.imag(w[:, :, freq, :, t_start:t_end+1]),
-                transpose_axes=(0, 1, 3, 2))
-            acc_dphi = np.expand_dims(acc_dphi, axis=-2)
-            # acc_dphi = _smooth_spectra(dphi, kernel)
-            dphi += np.sum(acc_dphi, axis=-1)
-        amp_sum = np.nansum(amp[:, :, freq, ...], axis=-1)
-        con = np.abs(dphi) / np.expand_dims(
-            np.sqrt(np.einsum('nil,nik->nilk', amp_sum, amp_sum)), axis=-1)
-        con = con[:, :, source_idx, target_idx, ...]
-        con_res[:, :, :, freq] = con.reshape(n_epochs, n_tapers, -1)
+    dphi = np.zeros((n_epochs, n_tapers, n_freqs, n_channels, n_channels),
+                    dtype=complex)
+    n_blocks = n_times // block_size if not n_times % block_size \
+        else n_times // block_size + 1
+    blocks = np.array_split(np.arange(n_times), n_blocks)
+    for block_indices in blocks:
+        t_start, t_end = block_indices[0], block_indices[-1]
+        acc_dphi = _multiply_conjugate_time(
+            np.real(w[..., t_start:t_end+1]),
+            np.imag(w[..., t_start:t_end+1]),
+            transpose_axes=(0, 1, 2, 4, 3))
+        # acc_dphi = np.transpose(acc_dphi, (0, 1, 3, 4, 2, 5))
+        # acc_dphi = _smooth_spectra(dphi, kernel)
+        # acc_dphi = np.transpose(acc_dphi, (0, 1, 4, 2, 3, 5))
+        dphi += np.sum(acc_dphi, axis=-1)
+    amp_sum = np.nansum(amp, axis=-1)
+    con = np.abs(dphi) / np.sqrt(
+        np.einsum('nijl,nijk->nijlk', amp_sum, amp_sum))
+    con = np.transpose(con, (0, 1, 3, 4, 2))
+    con = con[:, :, source_idx, target_idx, :]
+    con_res = con.reshape(n_epochs, n_tapers, -1, n_freqs)
 
     con_res = con_res.mean(axis=1)  # mean over tapers
 
@@ -507,28 +535,27 @@ def _plv(w, kernel, foi_idx, source_idx, target_idx, n_jobs, verbose, total,
     w = w.transpose((0, 2, 3, 1, 4))  # epochs, tapers, freqs, channels, times
     phase = w / np.abs(w)
     n_epochs, n_tapers, n_freqs, n_channels, n_times = w.shape
-    con_res = np.zeros((n_epochs, n_tapers, len(source_idx), n_freqs))
 
     # Compute using for-loop to reduce memory usage.
-    for freq in range(n_freqs):
-        n_blocks = n_times // block_size if not n_times % block_size \
-            else n_times // block_size + 1
-        blocks = np.array_split(np.arange(n_times), n_blocks)
-        dphi_sum = np.zeros((n_epochs, n_tapers, n_channels, n_channels, 1),
-                            dtype=complex)
-        for block_indices in blocks:
-            t_start, t_end = block_indices[0], block_indices[-1]
-            dphi = _multiply_conjugate_time(
-                np.real(phase[:, :, freq, :, t_start:t_end+1]),
-                np.imag(phase[:, :, freq, :, t_start:t_end+1]),
-                transpose_axes=(0, 1, 3, 2))
-            dphi = np.expand_dims(dphi, axis=-2)
-            # dphi = _smooth_spectra(dphi, kernel)
-            dphi_sum += np.sum(dphi, axis=-1)
-        con = abs(dphi_sum) / n_times
-        con = con[:, :, source_idx, target_idx, ...]
-        con_res[:, :, :, freq] = con.reshape(n_epochs, n_tapers, -1)
-
+    n_blocks = n_times // block_size if not n_times % block_size \
+        else n_times // block_size + 1
+    blocks = np.array_split(np.arange(n_times), n_blocks)
+    dphi_sum = np.zeros((n_epochs, n_tapers, n_freqs, n_channels, n_channels),
+                        dtype=complex)
+    for block_indices in blocks:
+        t_start, t_end = block_indices[0], block_indices[-1]
+        dphi = _multiply_conjugate_time(
+            np.real(phase[..., t_start:t_end+1]),
+            np.imag(phase[..., t_start:t_end+1]),
+            transpose_axes=(0, 1, 2, 4, 3))
+        # dphi = np.transpose(acc_dphi, (0, 1, 3, 4, 2, 5))
+        # dphi = _smooth_spectra(dphi, kernel)
+        # dphi = np.transpose(acc_dphi, (0, 1, 4, 2, 3, 5))
+        dphi_sum += np.sum(dphi, axis=-1)
+    con = abs(dphi_sum) / n_times
+    con = np.transpose(con, (0, 1, 3, 4, 2))
+    con = con[:, :, source_idx, target_idx, :]
+    con_res = con.reshape(n_epochs, n_tapers, -1, n_freqs)
     con_res = con_res.mean(axis=1)  # mean over tapers
 
     # mean over frequency bands if requested
@@ -546,27 +573,27 @@ def _pli(w, kernel, foi_idx, source_idx, target_idx, n_jobs, verbose, total,
     n_times)."""
     w = w.transpose((0, 2, 3, 1, 4))  # epochs, tapers, freqs, channels, times
     n_epochs, n_tapers, n_freqs, n_channels, n_times = w.shape
-    con_res = np.zeros((n_epochs, n_tapers, len(source_idx), n_freqs))
 
-    # Compute using for-loop to reduce memory usage.
-    for freq in range(n_freqs):
-        n_blocks = n_times // block_size if not n_times % block_size \
-            else n_times // block_size + 1
-        blocks = np.array_split(np.arange(n_times), n_blocks)
-        dphi_sign_sum = np.zeros((n_epochs, n_tapers,
-                                  n_channels, n_channels, 1), dtype=complex)
-        for block_indices in blocks:
-            t_start, t_end = block_indices[0], block_indices[-1]
-            dphi = _multiply_conjugate_time(
-                np.real(w[:, :, freq, :, t_start:t_end+1]),
-                np.imag(w[:, :, freq, :, t_start:t_end+1]),
-                transpose_axes=(0, 1, 3, 2))
-            dphi = np.expand_dims(dphi, axis=-2)
-            # dphi = _smooth_spectra(dphi, kernel)
-            dphi_sign_sum += np.sum(np.sign(np.imag(dphi)), axis=-1)
-        con = abs(dphi_sign_sum / n_times)
-        con = con[:, :, source_idx, target_idx, ...]
-        con_res[:, :, :, freq] = con.reshape(n_epochs, n_tapers, -1)
+    n_blocks = n_times // block_size if not n_times % block_size \
+        else n_times // block_size + 1
+    blocks = np.array_split(np.arange(n_times), n_blocks)
+    dphi_sign_sum = np.zeros((n_epochs, n_tapers, n_freqs, n_channels,
+                              n_channels),
+                    dtype=complex)
+    for block_indices in blocks:
+        t_start, t_end = block_indices[0], block_indices[-1]
+        dphi = _multiply_conjugate_time(
+            np.real(w[..., t_start:t_end+1]),
+            np.imag(w[..., t_start:t_end+1]),
+            transpose_axes=(0, 1, 2, 4, 3))
+        # dphi = np.transpose(acc_dphi, (0, 1, 3, 4, 2, 5))
+        # dphi = _smooth_spectra(dphi, kernel)
+        # dphi = np.transpose(acc_dphi, (0, 1, 4, 2, 3, 5))
+        dphi_sign_sum += np.sum(np.sign(np.imag(dphi)), axis=-1)
+    con = abs(dphi_sign_sum / n_times)
+    con = np.transpose(con, (0, 1, 3, 4, 2))
+    con = con[:, :, source_idx, target_idx, ...]
+    con_res = con.reshape(n_epochs, n_tapers, -1, n_freqs)
 
     con_res = con_res.mean(axis=1)  # mean over tapers
 
@@ -585,36 +612,36 @@ def _wpli(w, kernel, foi_idx, source_idx, target_idx, n_jobs, verbose, total,
     n_times)."""
     w = w.transpose((0, 2, 3, 1, 4))  # epochs, tapers, freqs, channels, times
     n_epochs, n_tapers, n_freqs, n_channels, n_times = w.shape
-    con_res = np.zeros((n_epochs, n_tapers, len(source_idx), n_freqs))
 
-    # Compute using for-loop to reduce memory usage.
-    for freq in range(n_freqs):
-        n_blocks = n_times // block_size if not n_times % block_size \
-            else n_times // block_size + 1
-        blocks = np.array_split(np.arange(n_times), n_blocks)
-        con_num_sum = np.zeros((n_epochs, n_tapers,
-                                  n_channels, n_channels, 1))
-        con_den_sum = np.zeros((n_epochs, n_tapers,
-                                  n_channels, n_channels, 1))
-        for block_indices in blocks:
-            t_start, t_end = block_indices[0], block_indices[-1]
-            dphi = _multiply_conjugate_time(
-                np.real(w[:, :, freq, :, t_start:t_end+1]),
-                np.imag(w[:, :, freq, :, t_start:t_end+1]),
-                transpose_axes=(0, 1, 3, 2))
-            dphi = np.expand_dims(dphi, axis=-2)
-            # dphi = _smooth_spectra(dphi, kernel)
-            con_num_sum += np.sum(abs(np.imag(dphi))
-                                  * np.sign(np.imag(dphi)), axis=-1)
-            con_den_sum += np.sum(abs(np.imag(dphi)), axis=-1)
-        con_num = abs(con_num_sum / n_times)
-        con_den = con_den_sum / n_times
-        con_den[con_den == 0] = 1
-        con = con_num / con_den
-        con = con[:, :, source_idx, target_idx, ...]
-        con_res[:, :, :, freq] = con.reshape(n_epochs, n_tapers, -1)
+    n_blocks = n_times // block_size if not n_times % block_size \
+        else n_times // block_size + 1
+    blocks = np.array_split(np.arange(n_times), n_blocks)
+    con_num_sum = np.zeros((n_epochs, n_tapers, n_freqs,
+                              n_channels, n_channels))
+    con_den_sum = np.zeros((n_epochs, n_tapers, n_freqs,
+                              n_channels, n_channels))
+    for block_indices in blocks:
+        t_start, t_end = block_indices[0], block_indices[-1]
+        dphi = _multiply_conjugate_time(
+            np.real(w[..., t_start:t_end+1]),
+            np.imag(w[..., t_start:t_end+1]),
+            transpose_axes=(0, 1, 2, 4, 3))
+        # dphi = np.transpose(acc_dphi, (0, 1, 3, 4, 2, 5))
+        # dphi = _smooth_spectra(dphi, kernel)
+        # dphi = np.transpose(acc_dphi, (0, 1, 4, 2, 3, 5))
+        con_num_sum += np.sum(abs(np.imag(dphi))
+                              * np.sign(np.imag(dphi)), axis=-1)
+        con_den_sum += np.sum(abs(np.imag(dphi)), axis=-1)
+    con_num = abs(con_num_sum / n_times)
+    con_den = con_den_sum / n_times
+    con_den[con_den == 0] = 1
+    con = con_num / con_den
+    con = np.transpose(con, (0, 1, 3, 4, 2))
+    con = con[:, :, source_idx, target_idx, ...]
+    con_res = con.reshape(n_epochs, n_tapers, -1, n_freqs)
 
-    con_res = con_res.mean(axis=1)  # mean over tapers
+    # Mean over tapers.
+    con_res = con_res.mean(axis=1)
 
     # mean over frequency bands if requested
     if isinstance(foi_idx, np.ndarray) and faverage:
