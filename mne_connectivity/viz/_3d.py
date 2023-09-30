@@ -22,7 +22,8 @@ FIDUCIAL_ORDER = (FIFF.FIFFV_POINT_LPA, FIFF.FIFFV_POINT_NASION,
 
 @fill_doc
 def plot_sensors_connectivity(info, con, picks=None,
-                              cbar_label='Connectivity'):
+                              cbar_label='Connectivity',
+                              n_con=20, cmap='RdBu'):
     """Visualize the sensor connectivity in 3D.
 
     Parameters
@@ -35,6 +36,12 @@ def plot_sensors_connectivity(info, con, picks=None,
         Indices of selected channels.
     cbar_label : str
         Label for the colorbar.
+    n_con : int
+        Number of strongest connections shown. By default 20.
+    cmap : str | instance of matplotlib.colors.Colormap
+        Colormap for coloring connections by strength. If :class:`str`, must
+        be a valid Matplotlib colormap (i.e. a valid key of
+        ``matplotlib.colormaps``). Default is ``"RdBu"``.
 
     Returns
     -------
@@ -64,13 +71,12 @@ def plot_sensors_connectivity(info, con, picks=None,
     renderer.sphere(np.c_[sens_loc[:, 0], sens_loc[:, 1], sens_loc[:, 2]],
                     color=(1, 1, 1), opacity=1, scale=0.005)
 
-    # Get the strongest connections
-    n_con = 20  # show up to 20 connections
-    min_dist = 0.05  # exclude sensors that are less than 5cm apart
+    # Get the strongest n_con connections
     threshold = np.sort(con, axis=None)[-n_con]
     ii, jj = np.where(con >= threshold)
 
     # Remove close connections
+    min_dist = 0.05  # exclude sensors that are less than 5cm apart
     con_nodes = list()
     con_val = list()
     for i, j in zip(ii, jj):
@@ -90,7 +96,8 @@ def plot_sensors_connectivity(info, con, picks=None,
                              destination=np.c_[x2, y2, z2],
                              scalars=np.c_[val, val],
                              vmin=vmin, vmax=vmax,
-                             reverse_lut=True)
+                             reverse_lut=True,
+                             colormap=cmap)
 
     renderer.scalarbar(source=tube, title=cbar_label)
 
